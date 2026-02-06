@@ -16,22 +16,24 @@ from telegram.ext import (
     ConversationHandler,
 )
 
-#Конфиг типа
+#Конфиг
 from config import TOKEN, ADMIN_IDS, MAX_BETA
 
-#Пути типа
+#Пути
 BASE_DIR = os.getcwd()
 DATA_DIR = os.path.join(BASE_DIR, "u")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-WAITING_FOR_CONFIG = 1
+#Статусы или состояния
+WAITING_FOR_REASON = 1
+WAITING_FOR_CONFIG = 2
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-#Транслит для создания базы данных каждого пользователя, если его first name в тг на кириллице
+#Транслит first name пользователя тг если оно у него написано на кириллице (видно только у тех у кого есть физический доступ к серверу и его хранилищу)
 CYR_TO_LAT = {
     'А': 'A', 'Б': 'B', 'В': 'V', 'Г': 'G', 'Д': 'D', 'Е': 'E', 'Ё': 'E', 'Ж': 'Zh',
     'З': 'Z', 'И': 'I', 'Й': 'Y', 'К': 'K', 'Л': 'L', 'М': 'M', 'Н': 'N', 'О': 'O',
@@ -54,7 +56,7 @@ def translit_name(name: str) -> str:
     res = re.sub(r'[^A-Za-z0-9_-]', '', res)
     return res or 'user'
 
-#Файлы/бд пользователей
+#Файлы пользователей
 
 def user_file_path(first_name: str, tg_id: int) -> str:
     base = translit_name(first_name)
@@ -108,7 +110,7 @@ def count_approved_users():
                 pass
     return count
 
-#Хэндлеры или же проще говоря команды и первое сообщения от бота при его запуске
+#Хэндлеры или же проще просто команды
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -119,23 +121,33 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# NEW Теперь apply запускает диалог: спрашиваем причину
 async def apply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Зачем вам нужен VPN? Коротко опишите цель использования.")
+    return WAITING_FOR_REASON
+
+
+# NEW Принимаем причину, сохраняем заявку и шлём админам
+async def receive_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    reason = update.message.text.strip()
 
     existing, _ = load_user_data_by_id(user.id)
     if existing:
         await update.message.reply_text("Заявка уже подана, ожидайте решения админов.")
-        return
+        return ConversationHandler.END
 
-    save_user_data(user.id, user.first_name, user.last_name, user.username)
+    path = save_user_data(user.id, user.first_name, user.last_name, user.username)
+    update_user_data_file(path, {'reason': reason})
 
-    await update.message.reply_text("Заявка отправлена админам.")
+    await update.message.reply_text("Спасибо, заявка отправлена администраторам на рассмотрение.")
 
     text = (
         f"Новая заявка на бета-тест\n"
         f"User: {user.full_name}\n"
         f"Username: @{user.username if user.username else '-'}\n"
-        f"TG ID: {user.id}"
+        f"TG ID: {user.id}\n\n"
+        f"Для чего VPN:\n{reason}"
     )
 
     kb = InlineKeyboardMarkup([[ 
@@ -144,7 +156,12 @@ async def apply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]])
 
     for admin_id in ADMIN_IDS:
-        await context.bot.send_message(admin_id, text, reply_markup=kb)
+        try:
+            await context.bot.send_message(admin_id, text, reply_markup=kb)
+        except Exception as e:
+            logger.error(f"Failed to send admin notification to {admin_id}: {e}")
+
+    return ConversationHandler.END
 
 
 async def slots_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -157,34 +174,54 @@ async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
 
-    _, action, target = query.data.split(":")
-    target_id = int(target)
+    parts = query.data.split(":")
+    if len(parts) != 3:
+        await query.edit_message_text("Неправильный callback data")
+        return
+    _, action, target = parts
+
+    try:
+        target_id = int(target)
+    except Exception:
+        await query.edit_message_text("Неправильный ID")
+        return
 
     if update.effective_user.id not in ADMIN_IDS:
+        await query.edit_message_text("Только админ может принять решение.")
         return
 
     user_data, path = load_user_data_by_id(target_id)
     if not user_data:
+        await query.edit_message_text("Данные пользователя не найдены (возможно устарели)")
         return
 
     if action == 'approve':
         if count_approved_users() >= MAX_BETA:
             await query.edit_message_text("Лимит слотов исчерпан.")
+            try:
+                await context.bot.send_message(target_id, "К сожалению, все слоты заняты. Попробуйте позже.")
+            except Exception:
+                pass
             return
 
         vpn_key = str(uuid4())
         update_user_data_file(path, {
             'status': 'approved',
             'vpn_key': vpn_key,
-            'approved_at': datetime.utcnow().isoformat() + 'Z'
+            'approved_at': datetime.utcnow().isoformat() + 'Z',
+            'approved_by': update.effective_user.id,
         })
 
-        await context.bot.send_message(target_id, f"Вы одобрены! Ваш ключ:\n`{vpn_key}`", parse_mode='Markdown')
+        await context.bot.send_message(target_id, f"Вы одобрены! Вскоре с вами свяжется менеджер или другой представитель для дальнейшей работы.", parse_mode='Markdown')
         await query.edit_message_text("Пользователь одобрен.")
 
     elif action == 'reject':
-        update_user_data_file(path, {'status': 'rejected'})
-        await context.bot.send_message(target_id, "Заявка отклонена.")
+        update_user_data_file(path, {
+            'status': 'rejected',
+            'rejected_by': update.effective_user.id,
+            'rejected_at': datetime.utcnow().isoformat() + 'Z'
+        })
+        await context.bot.send_message(target_id, "К сожалению ваша заявка отклонена.. У вас еще будет шанс! Если считаете это ошибкой, обратитесь на help@malikof.com")
         await query.edit_message_text("Пользователь отклонён.")
 
 
@@ -196,13 +233,24 @@ async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(json.dumps(ud, ensure_ascii=False, indent=2))
 
 
-#Главный или же основной раздел
+#Главный/основной раздел
 
 def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler('start', start_handler))
-    app.add_handler(CommandHandler('apply', apply_handler))
+
+    # Conversation для /apply -> вопрос -> ответ
+    conv = ConversationHandler(
+        entry_points=[CommandHandler('apply', apply_handler)],
+        states={
+            WAITING_FOR_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_reason)],
+        },
+        fallbacks=[],
+        allow_reentry=True,
+    )
+    app.add_handler(conv)
+
     app.add_handler(CommandHandler('slots', slots_handler))
     app.add_handler(CommandHandler('status', status_handler))
     app.add_handler(CallbackQueryHandler(admin_callback_handler, pattern=r'^admin:'))
